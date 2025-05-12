@@ -1,0 +1,334 @@
+{
+    "AWSTemplateFormatVersion": "2010-09-09",
+    "Parameters": {
+      "LambdaFunctionName": {
+        "Type": "String",
+        "Default": "MyVpcLambda"
+      }
+    },
+    "Resources": {
+      "VpcInfoTable": {
+        "Type": "AWS::DynamoDB::Table",
+        "Properties": {
+          "TableName": "VpcInfoTable",
+          "AttributeDefinitions": [
+            {
+              "AttributeName": "VpcId",
+              "AttributeType": "S"
+            }
+          ],
+          "KeySchema": [
+            {
+              "AttributeName": "VpcId",
+              "KeyType": "HASH"
+            }
+          ],
+          "ProvisionedThroughput": {
+            "ReadCapacityUnits": 5,
+            "WriteCapacityUnits": 5
+          }
+        }
+      },
+      "LambdaExecutionRole": {
+        "Type": "AWS::IAM::Role",
+        "Properties": {
+          "RoleName": "LambdaExecutionRole",
+          "AssumeRolePolicyDocument": {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Principal": {
+                  "Service": "lambda.amazonaws.com"
+                },
+                "Action": "sts:AssumeRole"
+              }
+            ]
+          },
+          "ManagedPolicyArns": [
+            "arn:aws:iam::aws:policy/AmazonEC2ReadOnlyAccess"
+          ],
+          "Policies": [
+            {
+              "PolicyName": "LambdaVpcPolicy",
+              "PolicyDocument": {
+                "Version": "2012-10-17",
+                "Statement": [
+                  {
+                    "Effect": "Allow",
+                    "Action": [
+                      "ec2:CreateVpc",
+                      "ec2:CreateTags",
+                      "ec2:DescribeVpcs",
+                      "ec2:ModifyVpcAttribute",
+                      "ec2:CreateInternetGateway",
+                      "ec2:AttachInternetGateway",
+                      "ec2:CreateSubnet",
+                      "ec2:CreateRouteTable",
+                      "ec2:CreateRoute",
+                      "ec2:AssociateRouteTable"
+                    ],
+                    "Resource": "*"
+                  },
+                  {
+                    "Effect": "Allow",
+                    "Action": [
+                      "dynamodb:PutItem",
+                      "dynamodb:Scan"
+                    ],
+                    "Resource": { "Fn::GetAtt": ["VpcInfoTable", "Arn"] }
+                  },
+                  {
+                    "Effect": "Allow",
+                    "Action": [
+                      "logs:CreateLogGroup",
+                      "logs:CreateLogStream",
+                      "logs:PutLogEvents"
+                    ],
+                    "Resource": "*"
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      },
+      "MyLambdaFunction": {
+        "Type": "AWS::Lambda::Function",
+        "Properties": {
+          "FunctionName": { "Ref": "LambdaFunctionName" },
+          "Handler": "index.lambda_handler",
+          "Runtime": "python3.9",
+          "Timeout": 30,
+          "Role": { "Fn::GetAtt": ["LambdaExecutionRole", "Arn"] },
+          "Code": {
+            "ZipFile": {
+              "Fn::Join": [
+                "\n",
+                [
+                  "import json",
+                  "import boto3",
+                  "import traceback",
+                  "import time",
+                  "",
+                  "ec2 = boto3.client('ec2')",
+                  "dynamodb = boto3.resource('dynamodb')",
+                  "table = dynamodb.Table('VpcInfoTable')",
+                  "",
+                  "def wait_for_vpc_creation(vpc_id):",
+                  "    while True:",
+                  "        vpcs = ec2.describe_vpcs(VpcIds=[vpc_id])['Vpcs']",
+                  "        if vpcs and vpcs[0]['State'] == 'available':",
+                  "            return True",
+                  "        time.sleep(5)",
+                  "",
+                  "def lambda_handler(event, context):",
+                  "    try:",
+                  "        method = event.get('httpMethod', '')",
+                  "        ",
+                  "        if method == 'POST':",
+                  "            body = json.loads(event.get('body', '{}'))",
+                  "            vpc_name = body.get('vpcName')",
+                  "            if not vpc_name:",
+                  "                return {'statusCode': 400, 'body': json.dumps({'error': 'Missing vpcName'})}",
+                  "",
+                  "            vpcs = ec2.describe_vpcs(Filters=[{'Name': 'tag:Name', 'Values': [vpc_name]}])['Vpcs']",
+                  "            if vpcs:",
+                  "                return {'statusCode': 400, 'body': json.dumps({'error': f\"VPC with name '{vpc_name}' already exists.\"})}",
+                  "",
+                  "            subnet_cidrs = ['10.0.1.0/24', '10.0.2.0/24', '10.0.3.0/24']",
+                  "",
+                  "            vpc = ec2.create_vpc(CidrBlock='10.0.0.0/16')",
+                  "            vpc_id = vpc['Vpc']['VpcId']",
+                  "            ec2.create_tags(Resources=[vpc_id], Tags=[{'Key': 'Name', 'Value': vpc_name}])",
+                  "            wait_for_vpc_creation(vpc_id)",
+                  "",
+                  "            igw = ec2.create_internet_gateway()['InternetGateway']['InternetGatewayId']",
+                  "            ec2.attach_internet_gateway(InternetGatewayId=igw, VpcId=vpc_id)",
+                  "",
+                  "            subnet_ids = []",
+                  "            for cidr in subnet_cidrs:",
+                  "                subnet = ec2.create_subnet(VpcId=vpc_id, CidrBlock=cidr)",
+                  "                subnet_ids.append(subnet['Subnet']['SubnetId'])",
+                  "",
+                  "            route_table = ec2.create_route_table(VpcId=vpc_id)['RouteTable']",
+                  "            route_table_id = route_table['RouteTableId']",
+                  "            ec2.create_route(RouteTableId=route_table_id, DestinationCidrBlock='0.0.0.0/0', GatewayId=igw)",
+                  "            for subnet_id in subnet_ids:",
+                  "                ec2.associate_route_table(RouteTableId=route_table_id, SubnetId=subnet_id)",
+                  "",
+                  "            table.put_item(Item={",
+                  "                'VpcId': vpc_id,",
+                  "                'VpcName': vpc_name,",
+                  "                'InternetGatewayId': igw,",
+                  "                'SubnetIds': subnet_ids,",
+                  "                'RouteTableId': route_table_id",
+                  "            })",
+                  "",
+                  "            return {",
+                  "                'statusCode': 200,",
+                  "                'body': json.dumps({",
+                  "                    'VpcId': vpc_id,",
+                  "                    'VpcName': vpc_name,",
+                  "                    'SubnetIds': subnet_ids,",
+                  "                    'InternetGatewayId': igw,",
+                  "                    'RouteTableId': route_table_id,",
+                  "                    'Message': 'VPC and resources created successfully.'",
+                  "                })",
+                  "            }",
+                  "",
+                  "        elif method == 'GET':",
+                  "            params = event.get('queryStringParameters') or {}",
+                  "            vpc_name = params.get('vpcName') if params else None",
+                  "",
+                  "            if vpc_name:",
+                  "                response = table.scan(FilterExpression=boto3.dynamodb.conditions.Attr('VpcName').eq(vpc_name))",
+                  "                items = response.get('Items', [])",
+                  "                if not items:",
+                  "                    return {'statusCode': 404, 'body': json.dumps({'error': f\"No VPC found with name '{vpc_name}'\"})}",
+                  "                return {'statusCode': 200, 'body': json.dumps(items)}",
+                  "            else:",
+                  "                result = table.scan()",
+                  "                return {'statusCode': 200, 'body': json.dumps(result.get('Items', []))}",
+                  "",
+                  "        else:",
+                  "            return {'statusCode': 405, 'body': json.dumps({'error': 'Method not allowed'})}",
+                  "",
+                  "    except Exception as e:",
+                  "        return {",
+                  "            'statusCode': 500,",
+                  "            'body': json.dumps({'error': str(e), 'trace': traceback.format_exc()})",
+                  "        }"
+                ]
+              ]
+            }
+          }
+        }
+      },
+      "CognitoUserPool": {
+        "Type": "AWS::Cognito::UserPool",
+        "Properties": {
+          "UserPoolName": "VpcUserPool",
+          "AutoVerifiedAttributes": ["email"],
+          "UsernameAttributes": ["email"],
+          "Policies": {
+            "PasswordPolicy": {
+              "MinimumLength": 8,
+              "RequireUppercase": true,
+              "RequireLowercase": true,
+              "RequireNumbers": true,
+              "RequireSymbols": false
+            }
+          }
+        }
+      },
+      "CognitoUserPoolClient": {
+        "Type": "AWS::Cognito::UserPoolClient",
+        "Properties": {
+          "ClientName": "VpcUserClient",
+          "UserPoolId": { "Ref": "CognitoUserPool" },
+          "GenerateSecret": false
+        }
+      },
+      "VpcCognitoAuthorizer": {
+        "Type": "AWS::ApiGateway::Authorizer",
+        "Properties": {
+          "Name": "VpcCognitoAuthorizer",
+          "Type": "COGNITO_USER_POOLS",
+          "IdentitySource": "method.request.header.Authorization",
+          "RestApiId": { "Ref": "MyRestApi" },
+          "ProviderARNs": [
+            { "Fn::GetAtt": ["CognitoUserPool", "Arn"] }
+          ]
+        }
+      },
+      "MyRestApi": {
+        "Type": "AWS::ApiGateway::RestApi",
+        "Properties": {
+          "Name": "NoAuthVpcAPI"
+        }
+      },
+      "MyApiResource": {
+        "Type": "AWS::ApiGateway::Resource",
+        "Properties": {
+          "ParentId": { "Fn::GetAtt": ["MyRestApi", "RootResourceId"] },
+          "PathPart": "invoke",
+          "RestApiId": { "Ref": "MyRestApi" }
+        }
+      },
+      "MyApiMethodPost": {
+        "Type": "AWS::ApiGateway::Method",
+        "Properties": {
+          "HttpMethod": "POST",
+          "AuthorizationType": "COGNITO_USER_POOLS",
+          "AuthorizerId": { "Ref": "VpcCognitoAuthorizer" },
+          "ResourceId": { "Ref": "MyApiResource" },
+          "RestApiId": { "Ref": "MyRestApi" },
+          "Integration": {
+            "Type": "AWS_PROXY",
+            "IntegrationHttpMethod": "POST",
+            "Uri": { "Fn::Sub": "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${MyLambdaFunction.Arn}/invocations" }
+          }
+        }
+      },
+      "MyApiMethodGet": {
+        "Type": "AWS::ApiGateway::Method",
+        "Properties": {
+          "HttpMethod": "GET",
+          "AuthorizationType": "COGNITO_USER_POOLS",
+          "AuthorizerId": { "Ref": "VpcCognitoAuthorizer" },
+          "ResourceId": { "Ref": "MyApiResource" },
+          "RestApiId": { "Ref": "MyRestApi" },
+          "Integration": {
+            "Type": "AWS_PROXY",
+            "IntegrationHttpMethod": "GET",
+            "Uri": { "Fn::Sub": "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${MyLambdaFunction.Arn}/invocations" }
+          }
+        }
+      },
+      "MyApiDeployment": {
+        "Type": "AWS::ApiGateway::Deployment",
+        "DependsOn": ["MyApiMethodPost", "MyApiMethodGet"],
+        "Properties": {
+          "RestApiId": { "Ref": "MyRestApi" },
+          "StageName": "prod"
+        }
+      },
+      "MyApiStage": {
+        "Type": "AWS::ApiGateway::Stage",
+        "Properties": {
+          "StageName": "dev",
+          "RestApiId": { "Ref": "MyRestApi" },
+          "DeploymentId": { "Ref": "MyApiDeployment" }
+        }
+      },
+      "LambdaApiInvokePermission": {
+        "Type": "AWS::Lambda::Permission",
+        "Properties": {
+          "FunctionName": { "Ref": "MyLambdaFunction" },
+          "Action": "lambda:InvokeFunction",
+          "Principal": "apigateway.amazonaws.com",
+          "SourceArn": {
+            "Fn::Sub": "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${MyRestApi}/*/*/invoke"
+          }
+        }
+      }
+    },
+    "Outputs": {
+      "CognitoUserPoolId": {
+        "Description": "Cognito User Pool ID",
+        "Value": { "Ref": "CognitoUserPool" }
+      },
+      "CognitoUserPoolClientId": {
+        "Description": "Cognito User Pool Client ID",
+        "Value": { "Ref": "CognitoUserPoolClient" }
+      },
+      "ApiGatewayInvokeUrl": {
+        "Description": "API Gateway Invoke URL",
+        "Value": {
+          "Fn::Sub": "https://${MyRestApi}.execute-api.${AWS::Region}.amazonaws.com/prod/invoke"
+        }
+      }
+    }
+  }
+  
